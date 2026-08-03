@@ -1,68 +1,43 @@
-"""Public API for the Multicellular Transformer package.
+"""Public API for the Multicellular Transformer package (scanpy-style).
 
-Import from here rather than reaching into ``cell_cell_interactions.modeling``
-or ``cell_cell_interactions.pp`` directly. The lower-level modules will keep
-working but their signatures are subject to internal refactoring.
+Users interact with three namespaces:
 
-Example
--------
->>> from cell_cell_interactions.api import load_model, CellarrInferencePreset
->>> model = load_model("checkpoints/multicellular_transformer.ckpt")
->>> embeddings = model.gene_embeddings(["EGFR", "TP53"])
->>> preset = CellarrInferencePreset(
-...     cell_tdb_uri="/path/to/cell_metadata",
-...     gene_tdb_uri="/path/to/gene_metadata",
-...     counts_tdb_uri="/path/to/counts",
-... )
->>> from cell_cell_interactions.api import embed_adata
->>> results = embed_adata(model, preset, max_batches=5)
+- :func:`cell_cell_interactions.load` — one call to get an :class:`MCTModel`.
+- :mod:`cell_cell_interactions.tl` — tools that turn embeddings into tables.
+- :mod:`cell_cell_interactions.pl` — plots.
+- :mod:`cell_cell_interactions.pp` — preprocessing helpers for AnnData input.
+
+Quick tour
+----------
+>>> import cell_cell_interactions as cci
+>>> mct = cci.load("/models/mct_v1", device="cuda")
+>>> emb = mct.gene_embeddings()                            # DataFrame (genes x dims)
+>>> ranking = cci.tl.rank_similar_genes(emb, "EGFR", 20)   # DataFrame
+>>> ax = cci.pl.similarity_ranking(ranking)                # Axes
+>>> sample_embs = mct.embed(adata,                         # AnnData in
+...                         cell_type_key="cell_type",
+...                         sample_key="donor_id")
+>>> per_donor_egfr = {k: df.loc["EGFR"] for k, df in sample_embs.items()}
 """
 
-from cell_cell_interactions.api.analysis import (
-    GeneEmbedding,
-    calculate_condition_specificity,
-    get_most_common_neighbors,
-    jaccard_similarity_across_items,
-)
-from cell_cell_interactions.api.data import (
-    AdataInferencePreset,
-    CellarrInferencePreset,
-    SpatialInferencePreset,
-)
-from cell_cell_interactions.api.inference import (
-    embed_adata,
-    embed_dataloader,
-    get_context_aware_gene_embeddings,
-)
+from cell_cell_interactions.api import pl, pp, tl
 from cell_cell_interactions.api.model import (
+    MASK_TOKEN_ID,
+    N_SPECIAL_TOKENS,
+    PAD_TOKEN_ID,
     MCTIndex,
     MCTModel,
-    load_model,
-)
-from cell_cell_interactions.api.plotting import (
-    plot_gene_set,
-    plot_similarity_across_conditions_heatmap,
+    load,
 )
 
 __all__ = [
-    # model
     "MCTIndex",
     "MCTModel",
-    "load_model",
-    # data
-    "AdataInferencePreset",
-    "CellarrInferencePreset",
-    "SpatialInferencePreset",
-    # inference
-    "embed_adata",
-    "embed_dataloader",
-    "get_context_aware_gene_embeddings",
-    # analysis
-    "GeneEmbedding",
-    "calculate_condition_specificity",
-    "get_most_common_neighbors",
-    "jaccard_similarity_across_items",
-    # plotting
-    "plot_gene_set",
-    "plot_similarity_across_conditions_heatmap",
+    "load",
+    "pl",
+    "pp",
+    "tl",
+    "PAD_TOKEN_ID",
+    "MASK_TOKEN_ID",
+    "N_SPECIAL_TOKENS",
 ]
