@@ -12,6 +12,14 @@ from scipy.sparse import coo_matrix
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
+from cell_cell_interactions.pp._shared import (
+    GENE_MASKING_STRATEGY,
+    TISSUE_MASKING_STRATEGY,
+    collate_bag_of_cells,
+    mask_gene_indices,
+    mask_tissue_indices,
+    stratified_pack_cells,
+)
 from cell_cell_interactions.pp.data_types import BagOfCellsBatch, BagOfCellsDatasetOutput, BagOfCellsSample
 from cell_cell_interactions.pp.utils import get_cell_type_order, group_cell_types_by_sample
 
@@ -24,20 +32,6 @@ config["sm.num_reader_threads"] = 1
 config["sm.num_tbb_threads"] = 1
 config["sm.num_writer_threads"] = 1
 config["vfs.num_threads"] = 1
-
-# define the masking strategy
-GENE_MASKING_STRATEGY = {
-    "mask_gene_id": 0.7,
-    "mask_gene_expression": 0.1,
-    "random": 0.1,
-    "no_mask": 0.1,
-}
-
-TISSUE_MASKING_STRATEGY = {
-    "mask": 0.7,
-    "random": 0.1,
-    "no_mask": 0.2,
-}
 
 
 class CellarrDataset(Dataset):
@@ -170,27 +164,8 @@ class CellarrDataset(Dataset):
         )
 
     def order_cells_in_input(self, sample_data: pd.Series | dict) -> tuple[list[int], list[int]]:
-        """Stratified sampling of cell types."""
-        cell_indices = []
-        cell_pad_mask = []
-        for ct, (start, end) in self.cell_type_input_order.items():
-            n_ct_cells = end - start
-            ct_data = sample_data.get(ct, [])
-            if len(ct_data) >= n_ct_cells:
-                # sample cells
-                ct_indices = random.sample(ct_data, n_ct_cells)
-                cell_indices += ct_indices
-                cell_pad_mask += [0] * n_ct_cells
-            elif len(ct_data) > 0:
-                n_to_fill = n_ct_cells - len(ct_data)
-                random.shuffle(ct_data)
-                cell_indices += ct_data + [self.cell_pad_idx] * n_to_fill
-                cell_pad_mask += [0] * len(ct_data) + [1] * n_to_fill
-            else:
-                cell_indices += [self.cell_pad_idx] * n_ct_cells
-                cell_pad_mask += [1] * n_ct_cells
-
-        return cell_indices, cell_pad_mask
+        """Stratified sampling of cell types (delegates to ``pp._shared``)."""
+        return stratified_pack_cells(sample_data, self.cell_type_input_order, self.cell_pad_idx)
 
 
 class CellarrDataModule(LightningDataModule):
@@ -280,15 +255,13 @@ class CellarrDataModule(LightningDataModule):
 
         Examples
         --------
-        >>> datamodule = MetricLearningZarrDataModule(
-                cell_tdb_uri="human_scref_cell_metadata",
-                counts_tdb_uri="human_scref_counts_matrix",
-                gene_tdb_uri="human_scref_gene_metadata",
-                gene_order="gene_order.tsv",
-                label_id_column="cellTypeOntologyID",
-                batch_size=1000,
-                num_workers=1,
-            )
+        >>> datamodule = CellarrDataModule(
+        ...     cell_tdb_uri="human_scref_cell_metadata",
+        ...     counts_tdb_uri="human_scref_counts_matrix",
+        ...     gene_tdb_uri="human_scref_gene_metadata",
+        ...     batch_size=1,
+        ...     num_workers=1,
+        ... )
         """
         super().__init__()
         self.cell_tdb_uri = cell_tdb_uri
@@ -571,71 +544,22 @@ class CellarrDataModule(LightningDataModule):
         )
 
     def mask(self, gene_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mask gene indices."""
-        # Step 1: Calculate the number of tokens to mask
-        gene_indices_w_mask = gene_indices.clone()
-        seq_len = gene_indices_w_mask.size(0)
-        num_masked_genes = int(seq_len * self.mask_prob)
-
-        # Step 2: Randomly select indices for masking
-        masked_indices = torch.randperm(seq_len)[:num_masked_genes]
-
-        # Step 3: Create a mask of the same size as the sequence
-        is_masked = torch.zeros_like(gene_indices_w_mask).type_as(gene_indices_w_mask)
-        is_masked[masked_indices] = 1
-
-        # Step 4: Randomly assign the masking strategy
-        probs = torch.rand(num_masked_genes)
-
-        mask_token = self.gene2idx["[MASK]"]
-        # 70% Replace with mask token
-        mask_gene_prob = GENE_MASKING_STRATEGY["mask_gene_id"]
-        gene_indices_w_mask[masked_indices[probs < mask_gene_prob]] = mask_token
-
-        # 10% replace with random gene
-        random_gene_prob = GENE_MASKING_STRATEGY["random"] + mask_gene_prob
-        random_indices = masked_indices[(probs >= mask_gene_prob) & (probs < random_gene_prob)]
-        gene_indices_w_mask[random_indices] = torch.randint(2, self.n_genes, (len(random_indices),))
-
-        # 10% mask gene expression
-        mask_gene_expression_prob = GENE_MASKING_STRATEGY["mask_gene_expression"] + random_gene_prob
-        mask_gene_expression = masked_indices[(probs >= random_gene_prob) & (probs < mask_gene_expression_prob)]
-        is_masked_gene_expression = torch.zeros_like(gene_indices_w_mask).type_as(gene_indices_w_mask)
-        is_masked_gene_expression[mask_gene_expression] = 1
-
-        # 10% we do not mask so we skip it
-
-        return gene_indices_w_mask, is_masked, is_masked_gene_expression
+        """Mask gene indices (delegates to ``pp._shared.mask_gene_indices``)."""
+        return mask_gene_indices(
+            gene_indices,
+            mask_prob=self.mask_prob,
+            mask_token=self.gene2idx["[MASK]"],
+            n_genes=self.n_genes,
+        )
 
     def mask_tissue(self, tissue_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mask tissue indices."""
-        # Step 1: Calculate the number of tokens to mask
-        tissue_labels = torch.ones_like(tissue_indices) * -100  # -100 is the ignore label
-        seq_len = tissue_indices.size(0)
-        num_masked_tissues = int(seq_len * self.mask_tissue_prob)
-        if num_masked_tissues == 0:
-            return tissue_indices, tissue_labels
-
-        # Step 2: Randomly select indices for masking
-        masked_indices = torch.randperm(seq_len)[:num_masked_tissues]
-        # assign the tissue labels
-        tissue_labels[masked_indices] = tissue_indices[masked_indices]
-
-        # Step 3: Randomly assign the masking strategy
-        probs = torch.rand(num_masked_tissues)
-
-        mask_token = self.tissue2idx["[MASK]"]
-        # 80% Replace with mask token
-        mask_tissue_prob = TISSUE_MASKING_STRATEGY["mask"]
-        tissue_indices[masked_indices[probs < mask_tissue_prob]] = mask_token
-
-        # 10% replace with random tissue
-        random_gene_prob = TISSUE_MASKING_STRATEGY["random"] + mask_tissue_prob
-        random_indices = masked_indices[(probs >= mask_tissue_prob) & (probs < random_gene_prob)]
-        tissue_indices[random_indices] = torch.randint(2, len(self.tissue2idx), (len(random_indices),))
-
-        # 10% we do not mask so we skip it
-        return tissue_indices, tissue_labels
+        """Mask tissue indices (delegates to ``pp._shared.mask_tissue_indices``)."""
+        return mask_tissue_indices(
+            tissue_indices,
+            mask_tissue_prob=self.mask_tissue_prob,
+            mask_token=self.tissue2idx["[MASK]"],
+            n_tissues=len(self.tissue2idx),
+        )
 
     def train_dataloader(self) -> DataLoader:
         """Load the training dataset.

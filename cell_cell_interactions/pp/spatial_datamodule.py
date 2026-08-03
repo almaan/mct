@@ -9,7 +9,7 @@ from lightning import LightningDataModule
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 
-from cell_cell_interactions.pp.cellarr_datamodule import GENE_MASKING_STRATEGY
+from cell_cell_interactions.pp._shared import GENE_MASKING_STRATEGY, mask_gene_indices
 from cell_cell_interactions.pp.data_types import BagOfCellsBatch, BagOfCellsSample
 from cell_cell_interactions.pp.utils import get_cell_type_order
 
@@ -114,41 +114,13 @@ class SpatialDataset(torch.utils.data.Dataset):
         )
 
     def mask(self, gene_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mask gene indices."""
-        # Step 1: Calculate the number of tokens to mask
-        gene_indices_w_mask = gene_indices.clone()
-        seq_len = gene_indices_w_mask.size(0)
-        num_masked_genes = int(seq_len * self.mask_prob)
-
-        # Step 2: Randomly select indices for masking
-        masked_indices = torch.randperm(seq_len)[:num_masked_genes]
-
-        # Step 3: Create a mask of the same size as the sequence
-        is_masked = torch.zeros_like(gene_indices_w_mask).type_as(gene_indices_w_mask)
-        is_masked[masked_indices] = 1
-
-        # Step 4: Randomly assign the masking strategy
-        probs = torch.rand(num_masked_genes)
-
-        mask_token = self.gene2idx["[MASK]"]
-        # 70% Replace with mask token
-        mask_gene_prob = GENE_MASKING_STRATEGY["mask_gene_id"]
-        gene_indices_w_mask[masked_indices[probs < mask_gene_prob]] = mask_token
-
-        # 10% replace with random gene
-        random_gene_prob = GENE_MASKING_STRATEGY["random"] + mask_gene_prob
-        random_indices = masked_indices[(probs >= mask_gene_prob) & (probs < random_gene_prob)]
-        gene_indices_w_mask[random_indices] = torch.randint(2, self.n_genes, (len(random_indices),))
-
-        # 10% mask gene expression
-        mask_gene_expression_prob = GENE_MASKING_STRATEGY["mask_gene_expression"] + random_gene_prob
-        mask_gene_expression = masked_indices[(probs >= random_gene_prob) & (probs < mask_gene_expression_prob)]
-        is_masked_gene_expression = torch.zeros_like(gene_indices_w_mask).type_as(gene_indices_w_mask)
-        is_masked_gene_expression[mask_gene_expression] = 1
-
-        # 10% we do not mask so we skip it
-
-        return gene_indices_w_mask, is_masked, is_masked_gene_expression
+        """Mask gene indices (delegates to ``pp._shared.mask_gene_indices``)."""
+        return mask_gene_indices(
+            gene_indices,
+            mask_prob=self.mask_prob,
+            mask_token=self.gene2idx["[MASK]"],
+            n_genes=self.n_genes,
+        )
 
 
 class SpatialDataModule(LightningDataModule):
