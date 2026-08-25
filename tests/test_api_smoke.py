@@ -241,6 +241,67 @@ def test_embed_returns_per_sample_dataframes(
         assert set(df.index) == set(genes)
 
 
+def test_forward_batch_matches_direct_module_call(
+    tiny_config: MulticellularGraphConfig,
+    tiny_batch,
+    seed: int,
+) -> None:
+    """forward_batch must be byte-identical to calling module(...) directly."""
+    torch.manual_seed(seed)
+    pl_a = MulticellularTransformerPLModel(tiny_config)
+    pl_a.eval()
+    torch.manual_seed(seed)
+    pl_b = MulticellularTransformerPLModel(tiny_config)
+    pl_b.eval()
+
+    mct = MCTModel(pl_a, MCTIndex())
+    out_api = mct.forward_batch(tiny_batch)
+    with torch.no_grad():
+        out_direct = pl_b.model(
+            expression_matrix=tiny_batch.expression_matrix,
+            gene_ids=tiny_batch.gene_ids,
+            is_masked_gene_expression=tiny_batch.is_masked_gene_expression,
+            padding_mask=tiny_batch.padding_mask,
+            tissue=None,
+        )
+    torch.testing.assert_close(
+        out_api.last_hidden_state, out_direct.last_hidden_state, atol=0.0, rtol=0.0
+    )
+    torch.testing.assert_close(
+        out_api.gene_id_logits, out_direct.gene_id_logits, atol=0.0, rtol=0.0
+    )
+
+
+def test_embed_dataloader_returns_dataframes_per_batch(
+    tiny_config: MulticellularGraphConfig,
+    tiny_batch,
+    seed: int,
+) -> None:
+    torch.manual_seed(seed)
+    pl_model = MulticellularTransformerPLModel(tiny_config)
+    pl_model.eval()
+    idx2gene = {i: f"G{i}" for i in range(tiny_config.n_genes)}
+    idx2gene[0] = "[PAD]"
+    idx2gene[1] = "[MASK]"
+    mct = MCTModel(pl_model, MCTIndex(idx2gene=idx2gene))
+
+    # Fake a dataloader by yielding the same batch twice.
+    def fake_loader():
+        yield tiny_batch
+        yield tiny_batch
+
+    results = mct.embed_dataloader(fake_loader(), max_batches=2)
+    assert len(results) == 2
+    for entry in results:
+        assert entry["gene_ids"].shape == tuple(tiny_batch.gene_ids.shape)
+        embs = entry["embeddings"]
+        assert len(embs) == tiny_batch.gene_ids.shape[0]
+        for df in embs:
+            assert df.shape[1] == tiny_config.gene_emb_dim
+            # No special tokens leak through
+            assert all(not sym.startswith("[") for sym in df.index)
+
+
 def test_embed_raises_on_missing_column(
     tiny_config: MulticellularGraphConfig, seed: int
 ) -> None:

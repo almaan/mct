@@ -42,8 +42,10 @@ Scanpy-style layout — one loader, three submodules:
 | Symbol | Purpose |
 |---|---|
 | `cci.load(model_dir, device=..., ...)` | Auto-discovers `.ckpt` + `gene2idx.json` / `cell_type_input_order.json` / `tissue2idx.json` under `model_dir`. Returns an `MCTModel`. |
-| `mct.gene_embeddings(genes=None)` | Zero-shot gene embeddings as a DataFrame indexed by symbol. |
-| `mct.embed(adata, cell_type_key, sample_key, tissue_key=None)` | Context-aware per-sample embeddings from an AnnData. Handles pseudobulk + normalization + forward pass. |
+| `mct.gene_embeddings(genes=None)` | Zero-shot gene embeddings as a DataFrame indexed by symbol. No context. |
+| `mct.embed(adata, cell_type_key, sample_key, tissue_key=None)` | **Contextual** per-sample embeddings from an AnnData. Handles pseudobulk + normalization + forward pass. |
+| `mct.embed_dataloader(dataloader)` | Contextual embeddings via a `CellarrDataModule` / `AdataRnaseqDataModule` dataloader. Paper-reproduction path. |
+| `mct.forward_batch(batch)` | Raw forward pass on a `BagOfCellsBatch`. Advanced use. |
 | `cci.tl.rank_similar_genes`, `pairwise_cosine_similarity`, `gene_neighbors`, `regress_out` | DataFrame in, DataFrame out. |
 | `cci.pl.similarity_ranking`, `similarity_heatmap`, `plot_gene_set`, `plot_similarity_across_conditions_heatmap` | Every function returns an `Axes` and never calls `plt.show()`. |
 | `cci.pp.filter_to_model_vocabulary`, `harmonize_cell_types`, `log_normalize` | AnnData / DataFrame preprocessing. |

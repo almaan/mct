@@ -189,7 +189,7 @@ def build_cellarr_dataset(manifest_path: Path, output_dir: Path, num_threads: in
     del tiledb_context
     print(dataset)
 
-    for component in ("cell_metadata", "gene_annotation", "sample_metadata", "assays/counts"):
+    for component in ("cell_metadata", "gene_annotation", "sample_metadata", "counts"):
         assert (output_dir / component).exists(), f"CellArr did not create expected component: {component}"
     copy_model_contract(manifest_path, manifest, output_dir)
 

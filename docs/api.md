@@ -89,7 +89,9 @@ MYC         0.098     0.021   ...    0.056
 
 #### `mct.embed(adata, cell_type_key="cell_type", sample_key="sample", tissue_key=None, target_sum=1e4) -> dict[str, pd.DataFrame]`
 
-Context-aware gene embeddings per sample.
+**Contextual gene embeddings per sample.** This is the paper's context-aware
+representation: the surrounding cellular ensemble shapes each gene's vector,
+so the same gene gets a different embedding in different samples.
 
 The AnnData is grouped by `sample_key` and, within each sample, pseudobulked
 by `cell_type_key` using the cell-type order the model was trained under.
@@ -110,6 +112,46 @@ dim_1     0.045
 
 Returned DataFrames have one row per gene present in that sample and are
 indexed by gene symbol.
+
+#### `mct.embed_dataloader(dataloader, max_batches=None) -> list[dict]`
+
+Same contextual embeddings as `mct.embed`, but takes a dataloader from a
+`CellarrDataModule` / `AdataRnaseqDataModule` / `SpatialDataModule`. Use this
+for paper-reproduction runs where the datamodule owns gene filtering,
+normalization, and cell-type stratification.
+
+Each entry has:
+- `sample_label` — list of sample identifiers (one per batch item).
+- `gene_ids` — token id array `(B, seq_len)`.
+- `embeddings` — list of DataFrames (one per batch item), indexed by gene symbol.
+
+```python
+>>> from cell_cell_interactions.pp.cellarr_datamodule import CellarrDataModule
+>>> dm = CellarrDataModule(
+...     cell_tdb_uri="/data/cell_metadata",
+...     gene_tdb_uri="/data/gene_annotation",
+...     counts_tdb_uri="/data/counts",
+...     cell_type_mapping=mct.index.cell_type_map,
+... )
+>>> results = mct.embed_dataloader(dm.val_dataloader(), max_batches=10)
+>>> results[0]["embeddings"][0].loc["EGFR"].shape
+(64,)
+```
+
+#### `mct.forward_batch(batch) -> MulticellularTransformerOutput`
+
+Raw one-shot forward pass on a `BagOfCellsBatch`. Byte-identical to calling
+`mct.module(...)` with the same tensors; the wrapper just handles moving
+inputs to `mct.device`.
+
+```python
+>>> batch = next(iter(dm.val_dataloader()))
+>>> out = mct.forward_batch(batch)
+>>> out.last_hidden_state.shape         # (B, n_expressed_genes, gene_emb_dim)
+torch.Size([1, 4823, 64])
+>>> out.gene_id_logits.shape            # masked-gene-modeling logits
+torch.Size([1, 4823, 12000])
+```
 
 ### `class MCTIndex`
 

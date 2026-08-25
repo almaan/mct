@@ -189,6 +189,124 @@ class MCTModel:
         return self
 
     # ------------------------------------------------------------------ #
+    # Low-level forward pass
+    # ------------------------------------------------------------------ #
+
+    @torch.no_grad()
+    def forward_batch(self, batch) -> MulticellularTransformerOutput:
+        """Run a single forward pass on a ``BagOfCellsBatch`` produced by a datamodule.
+
+        Handles moving every tensor to ``self.device``. Returns the raw
+        ``MulticellularTransformerOutput`` (``last_hidden_state``,
+        ``gene_id_logits``, ``tissue_logits``, ``gex_reconstruction``).
+        Byte-identical to calling the underlying ``self.module(...)`` with
+        the same tensors.
+
+        Use this when you already have a batch from an
+        ``AdataRnaseqDataModule`` / ``CellarrDataModule`` / ``SpatialDataModule``
+        and want the raw model output; use :meth:`embed` for the AnnData →
+        DataFrame convenience path.
+
+        Examples
+        --------
+        >>> dm = AdataRnaseqDataModule(adata_file_path=..., gene2idx=mct.gene2idx, ...)
+        >>> batch = next(iter(dm.val_dataloader()))
+        >>> out = mct.forward_batch(batch)
+        >>> out.last_hidden_state.shape
+        torch.Size([1, n_expressed_genes, 64])
+        """
+        device = self.device
+
+        def _move(x):
+            return x.to(device) if isinstance(x, torch.Tensor) else x
+
+        return self.module(
+            expression_matrix=_move(batch.expression_matrix),
+            gene_ids=_move(batch.gene_ids),
+            is_masked_gene_expression=_move(batch.is_masked_gene_expression),
+            padding_mask=_move(batch.padding_mask),
+            tissue=_move(batch.tissue_idx) if batch.tissue_idx is not None else None,
+        )
+
+    def embed_dataloader(
+        self,
+        dataloader,
+        max_batches: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Iterate a dataloader, run the model, and return per-batch contextual embeddings.
+
+        Use this for the paper-reproduction path where a datamodule
+        (``CellarrDataModule`` or ``AdataRnaseqDataModule``) is doing the
+        heavy lifting for gene filtering, expression normalization, and
+        cell-type stratification. For each batch you get a dict with:
+
+        - ``sample_label``: list of sample identifiers (one per batch item).
+        - ``gene_ids``: token ids per batch item as a ``numpy.ndarray``.
+        - ``embeddings``: list of ``pandas.DataFrame`` (one per batch item),
+          each indexed by gene symbol with columns ``dim_0 .. dim_{D-1}``.
+
+        Genes are demuxed through ``self.idx2gene``; PAD/MASK positions are
+        skipped.
+
+        Parameters
+        ----------
+        dataloader:
+            A dataloader yielding ``BagOfCellsBatch`` objects.
+        max_batches:
+            Optional cap on batches.
+
+        Examples
+        --------
+        >>> from cell_cell_interactions.pp.cellarr_datamodule import CellarrDataModule
+        >>> dm = CellarrDataModule(
+        ...     cell_tdb_uri="/data/cell_metadata",
+        ...     gene_tdb_uri="/data/gene_annotation",
+        ...     counts_tdb_uri="/data/counts",
+        ...     cell_type_mapping=mct.index.cell_type_map,
+        ... )
+        >>> results = mct.embed_dataloader(dm.val_dataloader(), max_batches=10)
+        >>> results[0]["embeddings"][0].loc["EGFR"].values.shape
+        (64,)
+        """
+        idx2gene = self.idx2gene
+        results: list[dict[str, Any]] = []
+        self.eval()
+        for i, batch in enumerate(dataloader):
+            if max_batches is not None and i >= max_batches:
+                break
+            out = self.forward_batch(batch)
+            hidden = out.last_hidden_state.detach().cpu().numpy()
+            gene_ids = batch.gene_ids.detach().cpu().numpy()
+            columns = [f"dim_{j}" for j in range(hidden.shape[-1])]
+
+            batch_embs: list[pd.DataFrame] = []
+            for b in range(gene_ids.shape[0]):
+                symbols = []
+                rows = []
+                for pos in range(gene_ids.shape[1]):
+                    gid = int(gene_ids[b, pos])
+                    if gid < N_SPECIAL_TOKENS:
+                        continue
+                    sym = idx2gene.get(gid)
+                    if sym is None:
+                        continue
+                    symbols.append(sym)
+                    rows.append(hidden[b, pos])
+                if rows:
+                    batch_embs.append(pd.DataFrame(rows, index=symbols, columns=columns))
+                else:
+                    batch_embs.append(pd.DataFrame(columns=columns))
+
+            results.append(
+                {
+                    "sample_label": list(batch.sample_label) if batch.sample_label is not None else None,
+                    "gene_ids": gene_ids,
+                    "embeddings": batch_embs,
+                }
+            )
+        return results
+
+    # ------------------------------------------------------------------ #
     # Zero-shot gene embeddings
     # ------------------------------------------------------------------ #
 
@@ -250,15 +368,25 @@ class MCTModel:
         tissue_key: str | None = None,
         target_sum: float = 1e4,
     ) -> dict[str, pd.DataFrame]:
-        """Compute context-aware gene embeddings per sample from an AnnData.
+        """Compute **contextual gene embeddings per sample** from an AnnData.
 
-        The AnnData is grouped by ``sample_key`` and, within each sample,
-        pseudobulked by ``cell_type_key`` using the cell-type ordering the
-        model was trained with. Counts are normalized to a
-        ``target_sum``-scaled log1p and then passed through the model.
-        The returned tensor for each sample has shape ``(n_genes,
-        gene_emb_dim)`` — one context-aware vector per gene present in that
-        sample, indexed by gene symbol.
+        This is the paper's context-aware embedding: within a sample the
+        surrounding cellular ensemble shapes each gene's vector, so the same
+        gene gets a different embedding in different samples. The AnnData is
+        grouped by ``sample_key`` and, within each sample, pseudobulked by
+        ``cell_type_key`` using the cell-type ordering the model was trained
+        with. Counts are normalized to a ``target_sum``-scaled log1p and
+        passed through the model.
+
+        Compare with:
+
+        - :meth:`gene_embeddings` — zero-shot, one vector per gene (no
+          context); rows of the classifier weight.
+        - :meth:`embed_dataloader` — same underlying computation as
+          :meth:`embed` but takes a pre-built ``CellarrDataModule`` /
+          ``AdataRnaseqDataModule`` dataloader for paper-reproduction runs.
+        - :meth:`forward_batch` — raw one-shot forward pass on a
+          ``BagOfCellsBatch`` for advanced use.
 
         Parameters
         ----------
@@ -397,9 +525,15 @@ def load(
         model_dir=model_dir, checkpoint_path=checkpoint_path, index_dir=index_dir
     )
 
-    pl_model = MulticellularTransformerPLModel.load_from_checkpoint(
-        str(ckpt_path), map_location=map_location
-    )
+    # Older MCT checkpoints pickle the hyperparameter dataclass with numpy
+    # scalars inside. torch>=2.6 defaults torch.load to weights_only=True,
+    # which refuses arbitrary pickle globals, and Lightning's
+    # load_from_checkpoint does not forward the flag. Monkey-patch
+    # torch.load for the duration of this call. Only load .ckpts you trust.
+    with _torch_load_weights_only_off():
+        pl_model = MulticellularTransformerPLModel.load_from_checkpoint(
+            str(ckpt_path), map_location=map_location
+        )
     index = (
         MCTIndex.from_dir(resolved_index_dir)
         if resolved_index_dir is not None
@@ -422,6 +556,32 @@ def load(
 # ---------------------------------------------------------------------- #
 # Path resolution / auto-discovery
 # ---------------------------------------------------------------------- #
+
+
+import contextlib
+import functools
+
+
+@contextlib.contextmanager
+def _torch_load_weights_only_off():
+    """Force ``weights_only=False`` inside the with-block.
+
+    torch>=2.6 changed the default. Lightning's ``load_from_checkpoint``
+    does not forward the flag, so we monkey-patch ``torch.load`` locally.
+    Restored on exit.
+    """
+    orig = torch.load
+
+    @functools.wraps(orig)
+    def patched(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return orig(*args, **kwargs)
+
+    torch.load = patched
+    try:
+        yield
+    finally:
+        torch.load = orig
 
 
 def _resolve_paths(
