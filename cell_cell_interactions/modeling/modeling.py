@@ -67,7 +67,15 @@ class MulticellularTransformerEncoder(nn.Module):
             activation="gelu",
             batch_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=pretrained_config.n_layers)
+        # enable_nested_tensor=False bypasses the "nested_from_padded" fast path
+        # which has no bf16 CUDA kernel: at bf16-true + long seq it falls back to
+        # a slow generic loop that pegs the GPU with tiny kernels. Regular padded
+        # attention with SDPA (Flash on B200) is fast in bf16.
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=pretrained_config.n_layers,
+            enable_nested_tensor=False,
+        )
 
     def forward(
         self,
@@ -85,10 +93,11 @@ class MulticellularTransformerEncoder(nn.Module):
         # get gene expression embeddings
         gene_expression_emb = self.gene_expression_encoder(expression_matrix)
 
-        if is_masked_gene_expression.sum() > 0:
-            gene_expression_emb[is_masked_gene_expression == 1] = self.gene_expression_mask_emb(
-                torch.tensor(0, device=gene_expression_emb.device)
-            ).type_as(gene_expression_emb)
+        # Unconditional torch.where avoids CPU sync from `.sum() > 0` and
+        # keeps torch.compile-friendly straight-line control flow.
+        mask_emb = self.gene_expression_mask_emb.weight[0].to(gene_expression_emb.dtype)
+        mask_bool = is_masked_gene_expression.bool().unsqueeze(-1)
+        gene_expression_emb = torch.where(mask_bool, mask_emb, gene_expression_emb)
 
         # sum gene id and gene expression embeddings
         gene_emb = gene_id_emb + gene_expression_emb

@@ -79,6 +79,6 @@ def get_pl_trainer(
         logger=logger,
         callbacks=callbacks,
         enable_model_summary=True,
-        precision="bf16-mixed" if torch.cuda.is_available() else "32-true",
+        precision=(getattr(config, "precision", "bf16-true") if torch.cuda.is_available() else "32-true"),
         strategy=config.strategy,
     )

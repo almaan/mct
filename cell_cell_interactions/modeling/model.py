@@ -3,7 +3,7 @@ from typing import Any
 import torch
 from lightning import LightningModule
 from torch.nn.functional import mse_loss
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 
 from cell_cell_interactions.modeling.data_types import MulticellularGraphConfig, MulticellularTransformerOutput
 from cell_cell_interactions.modeling.loss import compute_masked_gene_id_loss
@@ -23,6 +23,13 @@ class MulticellularTransformerPLModel(LightningModule):
         self.config = config
 
         self.model = MulticellularTransformerModule(config, pretrained_ckpt_path)
+
+        if getattr(config, "compile_model", False) and torch.cuda.is_available():
+            try:
+                self.model = torch.compile(self.model, dynamic=True)
+                print("torch.compile enabled on model")
+            except Exception as exc:
+                print(f"torch.compile failed, falling back to eager: {exc}")
 
         self.save_hyperparameters(logger=False)
 
@@ -84,21 +91,34 @@ class MulticellularTransformerPLModel(LightningModule):
         return metrics
 
     def configure_optimizers(self):
-        """Configure the optimizer for the model."""
+        """Configure the optimizer for the model.
+
+        Uses the same LR schedule as the reference `12k_no_pseudobulk.ckpt`:
+        linear warmup for `num_warmup_steps`, then CosineAnnealingLR with
+        `T_max = max_steps - num_warmup_steps` and `eta_min = 0`. Assembled
+        as a SequentialLR to match the saved scheduler state exactly. Both
+        pieces are torch built-ins; no external dep.
+        """
         self.optimizer = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
 
-        # Define the lambda function for linear warmup
-        def linear_warmup(step):
-            if step < self.config.num_warmup_steps:
-                return float(step) / float(max(1, self.config.num_warmup_steps))
-            return 1.0
+        warmup_steps = max(1, int(self.config.num_warmup_steps))
+        total_steps = max(warmup_steps + 1, int(self.config.max_steps))
+        cosine_steps = total_steps - warmup_steps
 
-        # Create the LambdaLR scheduler for warmup
-        self.scheduler = LambdaLR(self.optimizer, lr_lambda=linear_warmup)
+        def _linear_warmup(step: int) -> float:
+            return float(step) / float(warmup_steps)
+
+        warmup_sched = LambdaLR(self.optimizer, lr_lambda=_linear_warmup)
+        cosine_sched = CosineAnnealingLR(self.optimizer, T_max=cosine_steps, eta_min=0.0)
+        self.scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_sched, cosine_sched],
+            milestones=[warmup_steps],
+        )
 
         return (
             [self.optimizer],

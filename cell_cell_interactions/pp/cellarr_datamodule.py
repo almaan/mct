@@ -1,6 +1,8 @@
 import itertools
+import json
 import random
 from collections import defaultdict
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -12,6 +14,14 @@ from scipy.sparse import coo_matrix
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
+from cell_cell_interactions.pp._shared import (
+    GENE_MASKING_STRATEGY,
+    TISSUE_MASKING_STRATEGY,
+    collate_bag_of_cells,
+    mask_gene_indices,
+    mask_tissue_indices,
+    stratified_pack_cells,
+)
 from cell_cell_interactions.pp.data_types import BagOfCellsBatch, BagOfCellsDatasetOutput, BagOfCellsSample
 from cell_cell_interactions.pp.utils import get_cell_type_order, group_cell_types_by_sample
 
@@ -24,20 +34,6 @@ config["sm.num_reader_threads"] = 1
 config["sm.num_tbb_threads"] = 1
 config["sm.num_writer_threads"] = 1
 config["vfs.num_threads"] = 1
-
-# define the masking strategy
-GENE_MASKING_STRATEGY = {
-    "mask_gene_id": 0.7,
-    "mask_gene_expression": 0.1,
-    "random": 0.1,
-    "no_mask": 0.1,
-}
-
-TISSUE_MASKING_STRATEGY = {
-    "mask": 0.7,
-    "random": 0.1,
-    "no_mask": 0.2,
-}
 
 
 class CellarrDataset(Dataset):
@@ -115,6 +111,20 @@ class CellarrDataset(Dataset):
             data_df, self.sampleID, self.label_column, self.cell_types
         )
 
+        # Precompute per-sample scalars once so __getitem__ skips
+        # data_df.loc[cell_idx, col].iloc[0] pandas lookups on every call.
+        self._sample_scalars: dict = {}
+        has_tissue = self.tissue_column in data_df.columns
+        has_disease = self.disease_column in data_df.columns
+        grouped = data_df.groupby(self.sampleID, sort=False).first()
+        for sample_key, row in grouped.iterrows():
+            self._sample_scalars[sample_key] = (
+                row[self.study_column],
+                row[self.sample_column],
+                row[self.tissue_column] if has_tissue else None,
+                row[self.disease_column] if has_disease else None,
+            )
+
     def __len__(self) -> int:
         # if sampling by sample we randomly pick samples
         if self.sample_sampling == "random":
@@ -135,17 +145,8 @@ class CellarrDataset(Dataset):
         else:
             cell_idx = random.choices(sample_cell_indices, k=self.sample_size)
 
-        # fetch label data
-        study_label = self.data_df.loc[cell_idx, self.study_column].iloc[0]
-        sample_label = self.data_df.loc[cell_idx, self.sample_column].iloc[0]
-
-        tissue_label = None
-        if self.tissue_column in self.data_df.columns:
-            tissue_label = self.data_df.loc[cell_idx, self.tissue_column].iloc[0]
-
-        disease = None
-        if self.disease_column in self.data_df.columns:
-            disease = self.data_df.loc[cell_idx, self.disease_column].iloc[0]
+        # fetch precomputed sample-level scalars (no pandas lookup on hot path)
+        study_label, sample_label, tissue_label, disease = self._sample_scalars[sample]
 
         if self.cell_sampling == "random":
             # fetch the cell indices
@@ -170,27 +171,8 @@ class CellarrDataset(Dataset):
         )
 
     def order_cells_in_input(self, sample_data: pd.Series | dict) -> tuple[list[int], list[int]]:
-        """Stratified sampling of cell types."""
-        cell_indices = []
-        cell_pad_mask = []
-        for ct, (start, end) in self.cell_type_input_order.items():
-            n_ct_cells = end - start
-            ct_data = sample_data.get(ct, [])
-            if len(ct_data) >= n_ct_cells:
-                # sample cells
-                ct_indices = random.sample(ct_data, n_ct_cells)
-                cell_indices += ct_indices
-                cell_pad_mask += [0] * n_ct_cells
-            elif len(ct_data) > 0:
-                n_to_fill = n_ct_cells - len(ct_data)
-                random.shuffle(ct_data)
-                cell_indices += ct_data + [self.cell_pad_idx] * n_to_fill
-                cell_pad_mask += [0] * len(ct_data) + [1] * n_to_fill
-            else:
-                cell_indices += [self.cell_pad_idx] * n_ct_cells
-                cell_pad_mask += [1] * n_ct_cells
-
-        return cell_indices, cell_pad_mask
+        """Stratified sampling of cell types (delegates to ``pp._shared``)."""
+        return stratified_pack_cells(sample_data, self.cell_type_input_order, self.cell_pad_idx)
 
 
 class CellarrDataModule(LightningDataModule):
@@ -226,6 +208,10 @@ class CellarrDataModule(LightningDataModule):
         random_seed: int = 32,
         cell_type_mapping: dict | None = None,
         restrict_to_conditions: dict | None = None,  # restrict to specific conditions, e.g. {"study": "study1"}
+        split_file: str | Path | None = None,
+        train_fraction: float = 1.0,
+        prefetch_factor: int = 4,
+        persistent_workers: bool = True,
     ):
         """Constructor.
 
@@ -280,21 +266,39 @@ class CellarrDataModule(LightningDataModule):
 
         Examples
         --------
-        >>> datamodule = MetricLearningZarrDataModule(
-                cell_tdb_uri="human_scref_cell_metadata",
-                counts_tdb_uri="human_scref_counts_matrix",
-                gene_tdb_uri="human_scref_gene_metadata",
-                gene_order="gene_order.tsv",
-                label_id_column="cellTypeOntologyID",
-                batch_size=1000,
-                num_workers=1,
-            )
+        >>> datamodule = CellarrDataModule(
+        ...     cell_tdb_uri="human_scref_cell_metadata",
+        ...     counts_tdb_uri="human_scref_counts_matrix",
+        ...     gene_tdb_uri="human_scref_gene_metadata",
+        ...     batch_size=1,
+        ...     num_workers=1,
+        ... )
         """
         super().__init__()
         self.cell_tdb_uri = cell_tdb_uri
         self.gene_tdb_uri = gene_tdb_uri
         self.counts_tdb_uri = counts_tdb_uri
         self.val_samples = val_samples
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
+
+        # Ablation split: JSON of {test_samples, val_samples, train_samples[frac]}
+        # from make_ablation_split.py. Takes precedence over val_samples /
+        # val_set_proportion so all ablation runs share fixed val + test sets.
+        self._split_test_samples: list[str] | None = None
+        self._split_val_samples: list[str] | None = None
+        self._split_train_samples: list[str] | None = None
+        if split_file is not None:
+            split_payload = json.loads(Path(split_file).read_text())
+            assert split_payload.get("format_version") == 1, "Unsupported split_file version"
+            frac_key = f"{train_fraction:.2f}"
+            assert frac_key in split_payload["train_samples"], (
+                f"train_fraction {train_fraction} not in split_file "
+                f"(available: {list(split_payload['train_samples'])})"
+            )
+            self._split_test_samples = split_payload["test_samples"]
+            self._split_val_samples = split_payload["val_samples"]
+            self._split_train_samples = split_payload["train_samples"][frac_key]
         self.label_column = label_column
         self.study_column = study_column
         self.sample_column = sample_column
@@ -380,7 +384,21 @@ class CellarrDataModule(LightningDataModule):
             self.tissue2idx.update({t: idx + 2 for idx, t in enumerate(self.data_df[self.tissue_column].unique())})
 
         self.val_df = None
-        if self.val_samples is not None:
+        self.test_df = None
+        if self._split_train_samples is not None:
+            # Deterministic 3-way split from split_file. test/val are the same
+            # across every ablation run; train is a nested subset by fraction.
+            test_mask = self.data_df[self.sample_column].isin(self._split_test_samples)
+            val_mask = self.data_df[self.sample_column].isin(self._split_val_samples)
+            train_mask = self.data_df[self.sample_column].isin(self._split_train_samples)
+            self.test_df = self.data_df[test_mask]
+            self.val_df = self.data_df[val_mask]
+            self.data_df = self.data_df[train_mask]
+            # keep eval cell types confined to those seen in training
+            train_labels = set(self.data_df[self.label_column].unique())
+            self.val_df = self.val_df[self.val_df[self.label_column].isin(train_labels)]
+            self.test_df = self.test_df[self.test_df[self.label_column].isin(train_labels)]
+        elif self.val_samples is not None:
             # split out validation samples
             self.val_df = self.data_df[self.data_df[self.sample_column].isin(self.val_samples)]
             self.data_df = self.data_df[~self.data_df[self.sample_column].isin(self.val_samples)]
@@ -397,6 +415,8 @@ class CellarrDataModule(LightningDataModule):
         print(f"Training data size: {self.data_df.shape}")
         if self.val_df is not None:
             print(f"Validation data size: {self.val_df.shape}")
+        if self.test_df is not None:
+            print(f"Test data size: {self.test_df.shape}")
 
         self.class_names = sorted(set(self.data_df[self.label_column].values))
         self.label2int = {label: i for i, label in enumerate(self.class_names)}
@@ -427,7 +447,7 @@ class CellarrDataModule(LightningDataModule):
         )
 
         self.val_dataset = None
-        if len(self.val_df) > 0:
+        if self.val_df is not None and len(self.val_df) > 0:
             gp = self.val_df.groupby(self.sampleID)
             self.val_int2sample = dict(enumerate(gp.groups.keys()))
             self.val_sample2cells = {x: gp.groups[x].tolist() for x in gp.groups.keys()}
@@ -447,11 +467,38 @@ class CellarrDataModule(LightningDataModule):
                 agg_cell_type_gex=self.agg_cell_type_gex,
             )
 
+        self.test_dataset = None
+        if self.test_df is not None and len(self.test_df) > 0:
+            gp = self.test_df.groupby(self.sampleID)
+            self.test_int2sample = dict(enumerate(gp.groups.keys()))
+            self.test_sample2cells = {x: gp.groups[x].tolist() for x in gp.groups.keys()}
+            self.test_dataset = CellarrDataset(
+                data_df=self.test_df,
+                sample2cells=self.test_sample2cells,
+                int2sample=self.test_int2sample,
+                tissue2idx=self.tissue2idx,
+                sample_size=self.sample_size,
+                label_column=self.label_column,
+                study_column=self.study_column,
+                sample_column=self.sample_column,
+                tissue_column=self.tissue_column,
+                sample_sampling=sample_sampling,
+                cell_sampling=cell_sampling,
+                cell_type_input_order=self.cell_type_input_order,
+                agg_cell_type_gex=self.agg_cell_type_gex,
+            )
+
         self.cell_tdb.close()
         self.gene_tdb.close()
 
         self.counts_tdb_uri = counts_tdb_uri
-        self.counts_tdb = tiledb.open(self.counts_tdb_uri, "r", config=config)
+        # counts_tdb is NOT opened in the main process. TileDB warns that
+        # fork() after opening a context deadlocks; we open lazily per
+        # process (main + each worker) via _counts_handle(). Combined with
+        # multiprocessing_context="spawn" this makes multi-worker loading
+        # deadlock-free.
+        self.counts_tdb = None
+        self._counts_tdb_pid: int | None = None
 
     def collate(self, batch: list[BagOfCellsDatasetOutput]) -> BagOfCellsBatch:
         """Collate tensors.
@@ -469,12 +516,22 @@ class CellarrDataModule(LightningDataModule):
         """
         # call the counts tdb once per batch
         cell_indices = list(itertools.chain.from_iterable([x.cell_indices for x in batch]))
-        results = self.counts_tdb.multi_index[cell_indices, :]
-        counts = coo_matrix(
-            (results["data"], (results["cell_index"], results["gene_index"])),
-            shape=self.counts_shape,
+        cell_indices_np = np.asarray(cell_indices, dtype=np.int64)
+
+        # Build the batch sparse matrix at BATCH shape (unique_cells x n_genes)
+        # instead of the full counts_shape (13.9M x 59.5k). Old alloc dominated
+        # collate cost; TileDB dedupes the multi_index fetch, so we index-map
+        # each returned row into its position in unique_cells then gather back
+        # into cell_indices order (which repeats padding indices).
+        unique_cells = np.unique(cell_indices_np)
+        results = self._counts_handle().multi_index[unique_cells.tolist(), :]
+        row_pos = np.searchsorted(unique_cells, results["cell_index"])
+        counts_unique = coo_matrix(
+            (results["data"], (row_pos, results["gene_index"])),
+            shape=(len(unique_cells), self.counts_shape[1]),
         ).tocsr()
-        counts = counts[cell_indices, :].astype(np.float32)
+        gather_pos = np.searchsorted(unique_cells, cell_indices_np)
+        counts = counts_unique[gather_pos, :].astype(np.float32)
 
         # do log1-p normalization
         if self.lognorm:
@@ -571,120 +628,70 @@ class CellarrDataModule(LightningDataModule):
         )
 
     def mask(self, gene_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mask gene indices."""
-        # Step 1: Calculate the number of tokens to mask
-        gene_indices_w_mask = gene_indices.clone()
-        seq_len = gene_indices_w_mask.size(0)
-        num_masked_genes = int(seq_len * self.mask_prob)
-
-        # Step 2: Randomly select indices for masking
-        masked_indices = torch.randperm(seq_len)[:num_masked_genes]
-
-        # Step 3: Create a mask of the same size as the sequence
-        is_masked = torch.zeros_like(gene_indices_w_mask).type_as(gene_indices_w_mask)
-        is_masked[masked_indices] = 1
-
-        # Step 4: Randomly assign the masking strategy
-        probs = torch.rand(num_masked_genes)
-
-        mask_token = self.gene2idx["[MASK]"]
-        # 70% Replace with mask token
-        mask_gene_prob = GENE_MASKING_STRATEGY["mask_gene_id"]
-        gene_indices_w_mask[masked_indices[probs < mask_gene_prob]] = mask_token
-
-        # 10% replace with random gene
-        random_gene_prob = GENE_MASKING_STRATEGY["random"] + mask_gene_prob
-        random_indices = masked_indices[(probs >= mask_gene_prob) & (probs < random_gene_prob)]
-        gene_indices_w_mask[random_indices] = torch.randint(2, self.n_genes, (len(random_indices),))
-
-        # 10% mask gene expression
-        mask_gene_expression_prob = GENE_MASKING_STRATEGY["mask_gene_expression"] + random_gene_prob
-        mask_gene_expression = masked_indices[(probs >= random_gene_prob) & (probs < mask_gene_expression_prob)]
-        is_masked_gene_expression = torch.zeros_like(gene_indices_w_mask).type_as(gene_indices_w_mask)
-        is_masked_gene_expression[mask_gene_expression] = 1
-
-        # 10% we do not mask so we skip it
-
-        return gene_indices_w_mask, is_masked, is_masked_gene_expression
+        """Mask gene indices (delegates to ``pp._shared.mask_gene_indices``)."""
+        return mask_gene_indices(
+            gene_indices,
+            mask_prob=self.mask_prob,
+            mask_token=self.gene2idx["[MASK]"],
+            n_genes=self.n_genes,
+        )
 
     def mask_tissue(self, tissue_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mask tissue indices."""
-        # Step 1: Calculate the number of tokens to mask
-        tissue_labels = torch.ones_like(tissue_indices) * -100  # -100 is the ignore label
-        seq_len = tissue_indices.size(0)
-        num_masked_tissues = int(seq_len * self.mask_tissue_prob)
-        if num_masked_tissues == 0:
-            return tissue_indices, tissue_labels
+        """Mask tissue indices (delegates to ``pp._shared.mask_tissue_indices``)."""
+        return mask_tissue_indices(
+            tissue_indices,
+            mask_tissue_prob=self.mask_tissue_prob,
+            mask_token=self.tissue2idx["[MASK]"],
+            n_tissues=len(self.tissue2idx),
+        )
 
-        # Step 2: Randomly select indices for masking
-        masked_indices = torch.randperm(seq_len)[:num_masked_tissues]
-        # assign the tissue labels
-        tissue_labels[masked_indices] = tissue_indices[masked_indices]
+    def _counts_handle(self):
+        """Return a counts_tdb handle owned by the current process."""
+        import os
 
-        # Step 3: Randomly assign the masking strategy
-        probs = torch.rand(num_masked_tissues)
+        pid = os.getpid()
+        if getattr(self, "_counts_tdb_pid", None) != pid:
+            # Fork inherited the handle from the main process; reopen so this
+            # worker owns a fresh single-threaded handle. No contention across
+            # workers, no shared file descriptor state.
+            self.counts_tdb = tiledb.open(self.counts_tdb_uri, "r", config=config)
+            self._counts_tdb_pid = pid
+        return self.counts_tdb
 
-        mask_token = self.tissue2idx["[MASK]"]
-        # 80% Replace with mask token
-        mask_tissue_prob = TISSUE_MASKING_STRATEGY["mask"]
-        tissue_indices[masked_indices[probs < mask_tissue_prob]] = mask_token
-
-        # 10% replace with random tissue
-        random_gene_prob = TISSUE_MASKING_STRATEGY["random"] + mask_tissue_prob
-        random_indices = masked_indices[(probs >= mask_tissue_prob) & (probs < random_gene_prob)]
-        tissue_indices[random_indices] = torch.randint(2, len(self.tissue2idx), (len(random_indices),))
-
-        # 10% we do not mask so we skip it
-        return tissue_indices, tissue_labels
+    def _loader_kwargs(self, shuffle: bool) -> dict:
+        kwargs = dict(
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=False,
+            drop_last=True,
+            shuffle=shuffle,
+            collate_fn=self.collate,
+        )
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = self.persistent_workers
+            kwargs["prefetch_factor"] = self.prefetch_factor
+            # TileDB deadlocks under fork(); spawn workers get a fresh
+            # TileDB context and open counts via _counts_handle() lazily.
+            kwargs["multiprocessing_context"] = "spawn"
+        return kwargs
 
     def train_dataloader(self) -> DataLoader:
-        """Load the training dataset.
-
-        Returns
-        -------
-        DataLoader
-            A DataLoader object containing the training dataset.
-        """
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=False,
-            drop_last=True,
-            shuffle=True,
-            collate_fn=self.collate,
-            # multiprocessing_context="spawn",
-        )
+        """Load the training dataset."""
+        return DataLoader(self.train_dataset, **self._loader_kwargs(shuffle=True))
 
     def val_dataloader(self) -> DataLoader:
-        """Load the validation dataset.
-
-        Returns
-        -------
-        DataLoader
-            A DataLoader object containing the validation dataset.
-        """
+        """Load the validation dataset."""
         if self.val_dataset is None:
             return None
-
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=False,
-            drop_last=True,
-            shuffle=False,
-            collate_fn=self.collate,
-            # persistent_workers=True,
-            # multiprocessing_context="spawn",
-        )
+        return DataLoader(self.val_dataset, **self._loader_kwargs(shuffle=False))
 
     def test_dataloader(self) -> DataLoader:
         """Load the test dataset.
 
-        Returns
-        -------
-        DataLoader
-            A DataLoader object containing the test dataset.
+        When a split_file with a proper test partition was provided,
+        this returns the real held-out test loader; otherwise falls
+        back to the val loader (legacy behavior).
         """
+        if self.test_dataset is not None:
+            return DataLoader(self.test_dataset, **self._loader_kwargs(shuffle=False))
         return self.val_dataloader()

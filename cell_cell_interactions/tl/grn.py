@@ -1,6 +1,8 @@
 import collections
 import operator
-import os
+import tempfile
+import warnings
+from pathlib import Path
 from typing import Mapping
 
 import matplotlib.pyplot as plt
@@ -24,6 +26,10 @@ class GeneEmbedding(object):
         for gene in tqdm.tqdm(self.embeddings.keys()):
             self.vector.append(self.embeddings[gene])
             self.genes.append(gene)
+        # Populated by get_metagenes / clustering routines. Kept as None
+        # so cluster_definitions_as_df raises a clean error rather than
+        # AttributeError if called before clustering.
+        self.cluster_definitions = None
 
     def read_embedding(self, filename):
         embedding = dict()
@@ -36,9 +42,13 @@ class GeneEmbedding(object):
 
     def get_adata(self, resolution=20):
         mat = np.array(self.vector)
-        np.savetxt(".tmp.txt", mat)
-        gdata = sc.read_text(".tmp.txt")
-        os.remove(".tmp.txt")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as fh:
+            tmp_path = fh.name
+        try:
+            np.savetxt(tmp_path, mat)
+            gdata = sc.read_text(tmp_path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
         gdata.obs.index = self.genes
         sc.pp.neighbors(gdata, use_rep="X")
         sc.tl.leiden(gdata, resolution=resolution)
@@ -173,15 +183,6 @@ class GeneEmbedding(object):
         df = pd.DataFrame.from_dict({"Gene": genes, "Similarity": distance})
         return df
 
-    def generate_weighted_vector(self, genes, markers, weights):
-        vector = []
-        for gene, vec in zip(self.genes, self.vector):
-            if gene in genes and gene in weights:
-                vector.append(weights[gene] * np.array(vec))
-            if gene not in genes and gene in markers and gene in weights:
-                vector.append(list(weights[gene] * np.negative(np.array(vec))))
-        return list(np.sum(vector, axis=0))
-
     def generate_vector(self, genes):
         vector = []
         for gene, vec in zip(self.genes, self.vector):
@@ -201,6 +202,11 @@ class GeneEmbedding(object):
         return list(np.average(vector, axis=0, weights=weight))
 
     def cluster_definitions_as_df(self, top_n=20):
+        if self.cluster_definitions is None:
+            raise RuntimeError(
+                "cluster_definitions has not been populated. Call get_metagenes(...) "
+                "and assign its result to self.cluster_definitions before calling this."
+            )
         similarities = self.cluster_definitions
         clusters = []
         symbols = []
