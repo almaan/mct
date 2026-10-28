@@ -80,6 +80,14 @@ class MulticellularTransformerArgparser(Tap):
     ckpt_path: str = None
     pretrained_ckpt_path: str = None  # "/tmp/multicellular-graph-output/initial_test_runs/checkpoints/last.ckpt"
 
+    # ablation split + throughput knobs
+    split_file: str = None  # JSON produced by make_ablation_split.py; overrides train_split_prop
+    train_fraction: float = 1.0  # nested train subset from split_file (one of 0.10 / 0.25 / 0.50 / 1.00)
+    compile_model: bool = False  # torch.compile the model (disabled by default: Inductor crashes with our arch on torch 2.11)
+    precision: Literal["bf16-mixed", "bf16-true", "16-mixed", "32-true"] = "bf16-true"
+    prefetch_factor: int = 4  # DataLoader prefetch_factor when num_workers > 0
+    persistent_workers: bool = True  # DataLoader persistent_workers when num_workers > 0
+
     # parameters for running in silico gene KO on DepMap
     depmap_crispr_genes_file_path: str = None
     depmap_crispr_genes: Literal["random", "largest_effect", "all"] = "random"

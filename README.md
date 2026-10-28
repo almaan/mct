@@ -35,6 +35,19 @@ sample_embs["donor_42"].loc["EGFR"]
 Full walkthrough: [`tutorials/api_quickstart.ipynb`](tutorials/api_quickstart.ipynb).
 Full reference (every function with a runnable example): [`docs/api.md`](docs/api.md).
 
+## Agent skill
+
+[`skills/use-mct/SKILL.md`](skills/use-mct/SKILL.md) provides an
+[Agent Skills](https://agentskills.io/specification)-format guide for Claude Code,
+Codex, and other compatible coding agents. It focuses on choosing and analyzing
+gene embeddings, with paper-to-workflow mappings, advanced analysis strategies,
+and brief training guidance. It also documents current API limitations.
+
+Copy the entire `skills/use-mct/` folder into your client's skill directory to
+install it, or ask an agent to read its `SKILL.md` directly. Keep the `references/`
+folder alongside the entry point; repository paths in the guide refer to your
+MCT checkout. Installing the skill does not install MCT or download model weights.
+
 ## Public API surface
 
 Scanpy-style layout — one loader, three submodules:

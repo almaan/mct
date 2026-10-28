@@ -65,3 +65,5 @@ class MulticellularGraphConfig:
     accelerator: Literal["ddp", "cpu", "auto"] = "auto"
     experiment_name: str = "initial_test_runs"
     strategy: Literal["auto", "ddp"] = "ddp"
+    precision: Literal["bf16-mixed", "bf16-true", "16-mixed", "32-true"] = "bf16-true"
+    compile_model: bool = False

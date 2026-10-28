@@ -2,7 +2,19 @@ import json
 import os
 
 import numpy as np
+import torch
 import torch.cuda
+
+# PyTorch >=2.6 defaults `torch.load(..., weights_only=True)`, which blocks
+# Lightning's checkpoint resume because saved schedulers/optimizer state
+# contain numpy scalars. Trust our own checkpoints; force weights_only=False
+# before Lightning is imported.
+_orig_torch_load = torch.load
+def _torch_load_with_pickle(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _torch_load_with_pickle
+
 from lightning import seed_everything
 
 from cell_cell_interactions.modeling.argparser import MulticellularTransformerArgparser
@@ -22,6 +34,16 @@ def train(
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    if torch.cuda.is_available():
+        # Prefer Flash / mem-efficient SDPA kernels over the math fallback.
+        torch.set_float32_matmul_precision("high")
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(False)
+        except AttributeError:
+            pass  # older torch, keep defaults
+
     # get config
     config = MulticellularGraphConfig.from_dict(args.as_dict())
 
@@ -29,9 +51,6 @@ def train(
     if args.cell_type_mapping_file_path is not None:
         with open(args.cell_type_mapping_file_path) as f:
             cell_type_mapping = json.load(f)
-
-    if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
 
     # get the data
     datamodule = CellarrDataModule(
@@ -62,6 +81,10 @@ def train(
         target_sum=1e4,
         random_seed=args.random_seed,
         cell_type_mapping=cell_type_mapping,
+        split_file=args.split_file,
+        train_fraction=args.train_fraction,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
     )
     save_dicts(
         output_dir=output_dir,
